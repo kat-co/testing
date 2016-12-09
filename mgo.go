@@ -5,23 +5,17 @@ package testing
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"runtime"
-	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -49,7 +43,7 @@ var (
 	// WiredTiger storage engine much slower.
 	// https://jira.mongodb.org/browse/SERVER-21198
 	useJournalMongoVersion = version.Number{Major: 3, Minor: 2}
-	mongoVersion           lazyMongoVersion
+	// mongoVersion           lazyMongoVersion
 )
 
 const (
@@ -105,17 +99,19 @@ type MgoInstance struct {
 
 // Addr returns the address of the MongoDB server.
 func (m *MgoInstance) Addr() string {
-	return m.addr
+	//return m.addr
+	return fmt.Sprintf("127.0.0.1:%d", m.Port())
 }
 
 // Port returns the port of the MongoDB server.
 func (m *MgoInstance) Port() int {
-	return m.port
+	//return m.port
+	return 27017
 }
 
 // We specify a timeout to mgo.Dial, to prevent
 // mongod failures hanging the tests.
-const mgoDialTimeout = 60 * time.Second
+const mgoDialTimeout = 1 * time.Second
 
 // MgoSuite is a suite that deletes all content from the shared MongoDB
 // server at the end of every test and supplies a connection to the shared
@@ -149,264 +145,19 @@ func generatePEM(path string, serverCert *x509.Certificate, serverKey *rsa.Priva
 	return nil
 }
 
-// Start starts a MongoDB server in a temporary directory.
-func (inst *MgoInstance) Start(certs *Certs) error {
-	dbdir, err := ioutil.TempDir("", "test-mgo")
-	if err != nil {
-		return err
-	}
-	logger.Debugf("starting mongo in %s", dbdir)
-
-	// Give them all the same keyfile so they can talk appropriately.
-	keyFilePath := filepath.Join(dbdir, "keyfile")
-	err = ioutil.WriteFile(keyFilePath, []byte("not very secret"), 0600)
-	if err != nil {
-		return fmt.Errorf("cannot write key file: %v", err)
-	}
-
-	if certs != nil {
-		// Generate and save the server.pem file.
-		pemPath := filepath.Join(dbdir, "server.pem")
-		if err = generatePEM(pemPath, certs.ServerCert, certs.ServerKey); err != nil {
-			return fmt.Errorf("cannot write cert/key PEM: %v", err)
-		}
-		inst.certs = certs
-	}
-
-	// Attempt to start mongo up to maxStartMongodAttempts times,
-	// as the port we choose may be taken from us in the mean time.
-	for i := 0; i < maxStartMongodAttempts; i++ {
-		inst.port = FindTCPPort()
-		inst.addr = fmt.Sprintf("localhost:%d", inst.port)
-		inst.dir = dbdir
-		err = inst.run()
-		switch err.(type) {
-		case addrAlreadyInUseError:
-			logger.Debugf("failed to start mongo: %v, trying another port", err)
-			continue
-		case nil:
-			logger.Debugf("started mongod pid %d in %s on port %d", inst.server.Process.Pid, dbdir, inst.port)
-		default:
-			inst.addr = ""
-			inst.port = 0
-			os.RemoveAll(inst.dir)
-			inst.dir = ""
-			logger.Warningf("failed to start mongo: %v", err)
-		}
-		break
-	}
-	return err
-}
-
-// run runs the MongoDB server at the
-// address and directory already configured.
-func (inst *MgoInstance) run() error {
-	if inst.server != nil {
-		panic("mongo server is already running")
-	}
-
-	mgoport := strconv.Itoa(inst.port)
-	mgoargs := []string{
-		"--dbpath", inst.dir,
-		"--port", mgoport,
-		"--nssize", "1",
-		"--noprealloc",
-		"--smallfiles",
-		"--nohttpinterface",
-		"--oplogSize", "10",
-		"--ipv6",
-		"--setParameter", "enableTestCommands=1",
-	}
-	if runtime.GOOS != "windows" {
-		mgoargs = append(mgoargs, "--nounixsocket")
-	}
-	if inst.EnableAuth {
-		mgoargs = append(mgoargs,
-			"--auth",
-			"--keyFile", filepath.Join(inst.dir, "keyfile"),
-		)
-	}
-	if inst.certs != nil {
-		mgoargs = append(mgoargs,
-			"--sslOnNormalPorts",
-			"--sslPEMKeyFile", filepath.Join(inst.dir, "server.pem"),
-			"--sslPEMKeyPassword=ignored")
-	}
-	version, err := mongoVersion.Get()
-	if err != nil {
-		return err
-	}
-	if version.Compare(useJournalMongoVersion) == -1 {
-		mgoargs = append(mgoargs, "--nojournal")
-	}
-
-	if inst.Params != nil {
-		mgoargs = append(mgoargs, inst.Params...)
-	}
-	mongopath, err := getMongod()
-	if err != nil {
-		return err
-	}
-	logger.Debugf("found mongod at: %q", mongopath)
-	if mongopath == "/usr/lib/juju/bin/mongod" || mongopath == "/usr/lib/juju/mongo3.2/bin/mongod" {
-		inst.WithoutV8 = true
-	}
-	server := exec.Command(mongopath, mgoargs...)
-	out, err := server.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	server.Stderr = server.Stdout
-	exited := make(chan struct{})
-	started := make(chan error)
-	listening := make(chan error, 1)
-	go func() {
-		err := <-started
-		if err != nil {
-			close(listening)
-			close(exited)
-			return
-		}
-		// Wait until the server is listening.
-		var buf bytes.Buffer
-		prefix := fmt.Sprintf("mongod:%v", mgoport)
-		if readUntilMatching(prefix, io.TeeReader(out, &buf), waitingForConnectionsRe) {
-			listening <- nil
-		} else {
-			err := fmt.Errorf("mongod failed to listen on port %v", mgoport)
-			if strings.Contains(buf.String(), "addr already in use") {
-				err = addrAlreadyInUseError{err}
-			}
-			listening <- err
-		}
-		// Capture the last 100 lines of output from mongod, to log
-		// in the event of unclean exit.
-		lines := readLastLines(prefix, io.MultiReader(&buf, out), 100)
-		err = server.Wait()
-		exitErr, _ := err.(*exec.ExitError)
-		if err == nil || exitErr != nil && exitErr.Exited() {
-			// mongodb has exited without being killed, so print the
-			// last few lines of its log output.
-			logger.Errorf("mongodb has exited without being killed")
-			for _, line := range lines {
-				logger.Errorf("mongod: %s", line)
-			}
-		}
-		close(exited)
-	}()
-	inst.exited = exited
-	err = server.Start()
-	started <- err
-	if err != nil {
-		return err
-	}
-	err = <-listening
-	close(listening)
-	if err != nil {
-		return err
-	}
-	inst.server = server
-
+func (i *MgoInstance) Start(certs *Certs) error {
+	i.addr = i.Addr()
+	i.port = i.Port()
+	i.certs = certs
 	return nil
-}
-
-func getMongod() (string, error) {
-	// The last path is needed in tests on CentOS where PATH is being completely removed
-	paths := []string{"mongod", "/usr/lib/juju/bin/mongod", "/usr/lib/juju/mongo3.2/bin/mongod", "/usr/local/bin/mongod"}
-	if path := os.Getenv("JUJU_MONGOD"); path != "" {
-		paths = append([]string{path}, paths...)
-	}
-	var err error
-	var mongopath string
-	for _, path := range paths {
-		mongopath, err = exec.LookPath(path)
-		if err == nil {
-			return mongopath, nil
-		}
-		logger.Debugf("failed to find %q: %v", path, err)
-	}
-	return "", err
 }
 
 // The mongod --version line starts with this prefix.
 const versionLinePrefix = "db version v"
 
-func detectMongoVersion() (version.Number, error) {
-	mongoPath, err := getMongod()
-	if err != nil {
-		return version.Zero, errors.Trace(err)
-	}
-	output, err := exec.Command(mongoPath, "--version").Output()
-	if err != nil {
-		return version.Zero, errors.Trace(err)
-	}
-	// Read the first line of the output with a scanner (to handle
-	// newlines in a cross-platform way).
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	versionLine := ""
-	if scanner.Scan() {
-		versionLine = scanner.Text()
-	}
-	if scanner.Err() != nil {
-		return version.Zero, errors.Trace(scanner.Err())
-	}
-	if !strings.HasPrefix(versionLine, versionLinePrefix) {
-		return version.Zero, errors.New("couldn't get mongod version - no version line")
-	}
-	ver, err := version.Parse(versionLine[len(versionLinePrefix):])
-	if err != nil {
-		return version.Zero, errors.Trace(err)
-	}
-	logger.Debugf("detected mongod version %v", ver)
-	return ver, nil
-}
-
-// lazyMongoVersion stores the mongod version once we've got it.
-type lazyMongoVersion struct {
-	sync.Mutex
-	version version.Number
-}
-
-func (v *lazyMongoVersion) Get() (version.Number, error) {
-	v.Lock()
-	defer v.Unlock()
-	if v.version == version.Zero {
-		ver, err := detectMongoVersion()
-		if err != nil {
-			return version.Zero, errors.Trace(err)
-		}
-		v.version = ver
-	}
-	return v.version, nil
-}
-
-func (inst *MgoInstance) kill(sig os.Signal) {
-	inst.server.Process.Signal(sig)
-	<-inst.exited
-	inst.server = nil
-	inst.exited = nil
-}
-
-func (inst *MgoInstance) killAndCleanup(sig os.Signal) {
-	if inst.server != nil {
-		logger.Debugf("killing mongod pid %d in %s on port %d with %s", inst.server.Process.Pid, inst.dir, inst.port, sig)
-		inst.kill(sig)
-		os.RemoveAll(inst.dir)
-		inst.addr, inst.dir = "", ""
-	}
-}
-
 // Destroy kills mongod and cleans up its data directory.
 func (inst *MgoInstance) Destroy() {
-	inst.killAndCleanup(os.Kill)
-}
-
-// Restart restarts the mongo server, useful for
-// testing what happens when a state server goes down.
-func (inst *MgoInstance) Restart() {
-	logger.Debugf("restarting mongod pid %d in %s on port %d", inst.server.Process.Pid, inst.dir, inst.port)
-	inst.kill(os.Kill)
-	if err := inst.Start(inst.certs); err != nil {
+	if err := inst.Reset(); err != nil {
 		panic(err)
 	}
 }
@@ -418,7 +169,12 @@ func MgoTestPackage(t *testing.T, certs *Certs) {
 	if err := MgoServer.Start(certs); err != nil {
 		t.Fatal(err)
 	}
-	defer MgoServer.Destroy()
+	// defer MgoServer.Destroy()
+	defer func() {
+		if err := MgoServer.Reset(); err != nil {
+			panic(err)
+		}
+	}()
 	gc.TestingT(t)
 }
 
@@ -432,6 +188,10 @@ func (s *mgoLogger) Output(calldepth int, message string) error {
 	return nil
 }
 
+func namespaceFormat(instanceNum int) string {
+	return fmt.Sprintf("mongo-instance-%v", instanceNum)
+}
+
 func (s *MgoSuite) SetUpSuite(c *gc.C) {
 	mgo.SetLogger(&mgoLogger{loggo.GetLogger("mgo")})
 	mgo.SetDebug(true)
@@ -442,6 +202,7 @@ func (s *MgoSuite) SetUpSuite(c *gc.C) {
 	// Make tests that use password authentication faster.
 	utils.FastInsecureHash = true
 	mgo.ResetStats()
+	fmt.Printf("KT: %+v", MgoServer)
 	session, err := MgoServer.Dial()
 	c.Assert(err, jc.ErrorIsNil)
 	defer session.Close()
@@ -516,7 +277,7 @@ func (inst *MgoInstance) Dial() (*mgo.Session, error) {
 		Func: func() error {
 			var err error
 			session, err = mgo.DialWithInfo(inst.DialInfo())
-			return err
+			return errors.Trace(err)
 		},
 		// Only interested in retrying the intermittent
 		// 'unexpected message'.
@@ -527,13 +288,13 @@ func (inst *MgoInstance) Dial() (*mgo.Session, error) {
 		Clock:    clock.WallClock,
 		Attempts: 5,
 	})
-	return session, err
+	return session, errors.Trace(err)
 }
 
 // DialInfo returns information suitable for dialling the
 // receiving MongoDB instance.
 func (inst *MgoInstance) DialInfo() *mgo.DialInfo {
-	return MgoDialInfo(inst.certs, inst.addr)
+	return MgoDialInfo(nil, inst.addr)
 }
 
 // DialDirect returns a new direct connection to the shared MongoDB server. This
@@ -661,44 +422,23 @@ func (s *MgoSuite) SetUpTest(c *gc.C) {
 	session, err := MgoServer.Dial()
 	c.Assert(err, jc.ErrorIsNil)
 	s.Session = session
+
+	names, err := s.Session.DatabaseNames()
+	if err != nil {
+		panic(err)
+	}
+	c.Logf("KT: dbs: %+v", names)
 }
 
 // Reset deletes all content from the MongoDB server.
 func (inst *MgoInstance) Reset() error {
-	err := inst.EnsureRunning()
-	if err != nil {
-		return errors.Trace(err)
-	}
 	session, err := inst.Dial()
 	if err != nil {
 		return errors.Annotate(err, "inst.Dial() failed")
 	}
 	defer session.Close()
 
-	dbnames, ok, err := resetAdminPasswordAndFetchDBNames(session)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	if !ok {
-		// We restart it to regain access.  This should only
-		// happen when tests fail.
-		logger.Infof("restarting MongoDB server after unauthorized access")
-		inst.Destroy()
-		err := inst.Start(inst.certs)
-		return errors.Annotatef(err, "inst.Start(%v) failed", inst.certs)
-	}
-	logger.Infof("reset successfully reset admin password")
-	for _, name := range dbnames {
-		switch name {
-		case "local", "config":
-			// don't delete these
-			continue
-		}
-		if err := session.DB(name).DropDatabase(); err != nil {
-			return errors.Annotatef(err, "cannot drop MongoDB database %v", name)
-		}
-	}
-	return nil
+	return errors.Trace(dropAll(session))
 }
 
 // dropAll drops all databases apart from admin, local and config.
@@ -713,7 +453,7 @@ func dropAll(session *mgo.Session) (err error) {
 		default:
 			err = session.DB(name).DropDatabase()
 			if err != nil {
-				return err
+				return errors.Annotatef(err, "cannot drop MongoDB database %v", name)
 			}
 		}
 	}
@@ -747,9 +487,6 @@ func resetAdminPasswordAndFetchDBNames(session *mgo.Session) ([]string, bool, er
 		}
 		dbnames, err := session.DatabaseNames()
 		if err == nil {
-			if err := admin.RemoveUser("admin"); err != nil {
-				return nil, false, errors.Trace(err)
-			}
 			return dbnames, true, nil
 		}
 		if !isUnauthorized(err) {
@@ -778,25 +515,12 @@ func isUnauthorized(err error) bool {
 	return false
 }
 
-func (inst *MgoInstance) EnsureRunning() error {
-	// If the server has already been destroyed for testing purposes,
-	// just start it again.
-	if inst.Addr() == "" {
-		logger.Debugf("restarting mongo instance")
-		err := inst.Start(inst.certs)
-		return errors.Annotatef(err, "inst.Start(%v) failed", inst.certs)
-	}
-	return nil
-}
-
 func (s *MgoSuite) TearDownTest(c *gc.C) {
 	if s.Session == nil {
 		c.Fatal("SetUpTest failed")
 	}
 
-	err := MgoServer.EnsureRunning()
-	c.Assert(err, jc.ErrorIsNil)
-
+	var err error
 	// If the Session we have doesn't know about
 	// the address of the server, then we should reconnect.
 	foundAddress := false
@@ -820,18 +544,6 @@ func (s *MgoSuite) TearDownTest(c *gc.C) {
 	c.Assert(err, jc.ErrorIsNil)
 	s.Session.Close()
 	s.Session = nil
-
-	for i := 0; ; i++ {
-		stats := mgo.GetStats()
-		if stats.SocketsInUse == 0 && stats.SocketsAlive == 0 {
-			break
-		}
-		if i == 20 {
-			c.Fatal("Test left sockets in a dirty state")
-		}
-		c.Logf("Waiting for sockets to die: %d in use, %d alive", stats.SocketsInUse, stats.SocketsAlive)
-		time.Sleep(500 * time.Millisecond)
-	}
 }
 
 // ProxiedSession represents a mongo session that's

@@ -6,10 +6,10 @@
 
 package testing
 
-import "os"
-
 // DestroyWithLog causes mongod to exit, cleans up its data directory,
 // and captures the last N lines of mongod's log output.
 func (inst *MgoInstance) DestroyWithLog() {
-	inst.killAndCleanup(os.Interrupt)
+	if err := inst.Reset(); err != nil {
+		panic(err)
+	}
 }
